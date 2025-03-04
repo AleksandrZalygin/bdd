@@ -1131,88 +1131,63 @@ begin
 end $$;
 
 -- Процедура расчета поправок по ветровому ружью
-create or replace procedure public.sp_calc_wind_drift_correction(
-    in par_height integer,
-    in par_wind_speed integer,
-    out par_corrections integer
-)
-language plpgsql as $$
-declare
-    var_height_id integer;
-    var_correction integer;
-begin
-    -- Находим ближайшую стандартную высоту
-    select id into var_height_id
-    from public.wind_drift_heights
-    where standard_height = (
-        select standard_height
-        from public.wind_drift_heights
-        where standard_height <= par_height
-        order by standard_height desc
-        limit 1
-    );
-
-    -- Находим поправку
-    select correction_value into var_correction
-    from public.wind_drift_corrections
-    where wind_drift_height_id = var_height_id
-      and wind_speed = par_wind_speed;
-
-    par_corrections := var_correction;
-end $$;
-
--- Проверка процедуры
-do $$
-declare
-    var_correction integer;
-begin
-    call public.sp_calc_wind_drift_correction(
-        par_height := 1200,
-        par_wind_speed := 100,
-        par_corrections => var_correction
-    );
-    raise notice 'Поправка для высоты 1200 и скорости ветра 100: %', var_correction;
-end $$;
-
--- Индексы
-create index idx_wind_drift_corrections_height
-    on public.wind_drift_corrections(wind_drift_height_id);
-create index idx_wind_drift_corrections_wind_speed
-    on public.wind_drift_corrections(wind_speed);
-
--- View с отчетом
 create or replace view public.vw_effective_measurement_height as
 with
-user_measurements as (
+-- Получаем информацию о пользователях и их званиях
+cte_users as (
     select
         e.id as employee_id,
         e.name as user_name,
-        mr.description as position,
-        count(mip.id) as quantity,
-        count(case when not (public.fn_check_input_params(
-            mip.height, mip.temperature, mip.pressure,
-            mip.wind_direction, mip.wind_speed, mip.bullet_demolition_range
-        )).is_check then 1 end) as quantity_fails,
-        min(mip.height) as min_height,
-        max(mip.height) as max_height
+        mr.description as position
     from public.employees e
     join public.military_ranks mr on e.military_rank_id = mr.id
-    join public.measurment_baths mb on mb.emploee_id = e.id
+),
+-- Получаем все измерения с вычислением флага ошибки (0 – корректное, 1 – ошибочное)
+cte_measurements as (
+    select
+        mb.emploee_id,
+        mip.height,
+        mip.temperature,
+        mip.pressure,
+        mip.wind_direction,
+        mip.wind_speed,
+        mip.bullet_demolition_range,
+        case
+            when (public.fn_check_input_params(
+                        mip.height, mip.temperature, mip.pressure,
+                        mip.wind_direction, mip.wind_speed, mip.bullet_demolition_range
+                  )).is_check
+            then 0
+            else 1
+        end as error_flag
+    from public.measurment_baths mb
     join public.measurment_input_params mip on mip.id = mb.measurment_input_param_id
-    group by e.id, e.name, mr.description
-    having
-        count(mip.id) >= 5 and
-        count(case when not (public.fn_check_input_params(
-            mip.height, mip.temperature, mip.pressure,
-            mip.wind_direction, mip.wind_speed, mip.bullet_demolition_range
-        )).is_check then 1 end) < 10
+),
+-- Агрегируем данные по количеству измерений, сумме ошибок и диапазонам высот
+cte_agg as (
+    select
+         emploee_id,
+         count(*) as quantity,
+         sum(error_flag) as quantity_fails,
+         min(height) as min_height,
+         max(height) as max_height
+    from cte_measurements
+    group by emploee_id
+),
+-- Фильтруем пользователей по условию: минимум 5 измерений и менее 10 ошибок
+cte_filtered as (
+    select *
+    from cte_agg
+    where quantity >= 5 and quantity_fails < 10
 )
+-- Объединяем информацию о пользователях и агрегированные данные
 select
-    user_name as "ФИО пользователя",
-    position as "Звание",
-    min_height as "Мин. высота метеопоста",
-    max_height as "Макс. высота метеопоста",
-    quantity as "Всего измерений",
-    quantity_fails as "Из них ошибочных"
-from user_measurements
-order by quantity_fails desc;
+    u.user_name as "ФИО пользователя",
+    u.position as "Звание",
+    f.min_height as "Мин. высота метеопоста",
+    f.max_height as "Макс. высота метеопоста",
+    f.quantity as "Всего измерений",
+    f.quantity_fails as "Из них ошибочных"
+from cte_users u
+join cte_filtered f on u.employee_id = f.emploee_id
+order by f.quantity_fails desc;
