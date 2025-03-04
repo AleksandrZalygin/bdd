@@ -1069,3 +1069,125 @@ from
 ) as tt
 order by tt.quantity_fails desc;
 
+
+-- Структура для хранения корректировок ветрового дрейфа
+create sequence wind_drift_heights_seq;
+create table public.wind_drift_heights (
+    id integer primary key default nextval('wind_drift_heights_seq'),
+    standard_height integer not null unique
+);
+
+create sequence wind_drift_correction_seq;
+create table public.wind_drift_corrections (
+    id integer primary key default nextval('wind_drift_correction_seq'),
+    wind_drift_height_id integer not null,
+    wind_speed integer not null,
+    correction_value integer not null,
+
+    constraint fk_wind_drift_height
+        foreign key (wind_drift_height_id)
+        references public.wind_drift_heights(id)
+);
+
+-- Наполнение справочника высот
+insert into public.wind_drift_heights(standard_height)
+values (200), (400), (800), (1200), (1600), (2000), (2400), (3000), (4000);
+
+-- Наполнение корректировок
+do $$
+declare
+    drift_data constant integer[][] := array[
+        array[200, 3, 4, 5, 6, 7, 7, 8, 9, 10, 11, 12, 12],
+        array[400, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        array[800, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16],
+        array[1200, 4, 5, 7, 8, 8, 9, 11, 12, 13, 14, 15, 16],
+        array[1600, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17],
+        array[2000, 4, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 18],
+        array[2400, 4, 6, 8, 9, 9, 10, 12, 14, 15, 16, 17, 19],
+        array[3000, 5, 6, 8, 9, 10, 11, 12, 14, 15, 17, 18, 19],
+        array[4000, 5, 6, 8, 9, 10, 11, 12, 14, 15, 16, 18, 20]
+    ];
+    current_height_id integer;
+    wind_speeds integer[] := array[40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150];
+    height_row integer[];
+begin
+    foreach height_row slice 1 in array drift_data loop
+        select id into current_height_id
+        from public.wind_drift_heights
+        where standard_height = height_row[1];
+
+        for i in 2..array_length(height_row, 1) loop
+            insert into public.wind_drift_corrections(
+                wind_drift_height_id,
+                wind_speed,
+                correction_value
+            ) values (
+                current_height_id,
+                wind_speeds[i-1],
+                height_row[i]
+            );
+        end loop;
+    end loop;
+end $$;
+
+-- Процедура расчета поправок по ветровому ружью
+create or replace view public.vw_effective_measurement_height as
+with
+-- Получаем информацию о пользователях и их званиях
+cte_users as (
+    select
+        e.id as employee_id,
+        e.name as user_name,
+        mr.description as position
+    from public.employees e
+    join public.military_ranks mr on e.military_rank_id = mr.id
+),
+-- Получаем все измерения с вычислением флага ошибки (0 – корректное, 1 – ошибочное)
+cte_measurements as (
+    select
+        mb.emploee_id,
+        mip.height,
+        mip.temperature,
+        mip.pressure,
+        mip.wind_direction,
+        mip.wind_speed,
+        mip.bullet_demolition_range,
+        case
+            when (public.fn_check_input_params(
+                        mip.height, mip.temperature, mip.pressure,
+                        mip.wind_direction, mip.wind_speed, mip.bullet_demolition_range
+                  )).is_check
+            then 0
+            else 1
+        end as error_flag
+    from public.measurment_baths mb
+    join public.measurment_input_params mip on mip.id = mb.measurment_input_param_id
+),
+-- Агрегируем данные по количеству измерений, сумме ошибок и диапазонам высот
+cte_agg as (
+    select
+         emploee_id,
+         count(*) as quantity,
+         sum(error_flag) as quantity_fails,
+         min(height) as min_height,
+         max(height) as max_height
+    from cte_measurements
+    group by emploee_id
+),
+-- Фильтруем пользователей по условию: минимум 5 измерений и менее 10 ошибок
+cte_filtered as (
+    select *
+    from cte_agg
+    where quantity >= 5 and quantity_fails < 10
+)
+-- Объединяем информацию о пользователях и агрегированные данные
+select
+    u.user_name as "ФИО пользователя",
+    u.position as "Звание",
+    f.min_height as "Мин. высота метеопоста",
+    f.max_height as "Макс. высота метеопоста",
+    f.quantity as "Всего измерений",
+    f.quantity_fails as "Из них ошибочных"
+from cte_users u
+join cte_filtered f on u.employee_id = f.emploee_id
+order by f.quantity_fails desc;
